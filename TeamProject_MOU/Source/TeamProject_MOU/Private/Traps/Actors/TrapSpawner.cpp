@@ -1,0 +1,484 @@
+﻿#include "Traps/Actors/TrapSpawner.h"
+#include "Traps/Actors/TrapBearTrap.h"
+#include "Traps/Actors/TrapElectricPanel.h"
+#include "Components/BoxComponent.h"
+#include "Components/SceneComponent.h"
+#include "Components/BillboardComponent.h"
+#include "Engine/World.h"
+#include "CollisionQueryParams.h"
+#include "DrawDebugHelpers.h"
+#include "TimerManager.h"
+#include "UObject/ConstructorHelpers.h"
+#include "GameFramework/Volume.h"
+#include "GameFramework/Pawn.h"
+#include "Components/MeshComponent.h"
+
+ATrapSpawner::ATrapSpawner()
+{
+	PrimaryActorTick.bCanEverTick = false;
+	bReplicates = true;
+
+	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
+	SetRootComponent(SceneRoot);
+
+	EditorIcon = CreateDefaultSubobject<UBillboardComponent>(TEXT("EditorIcon"));
+	EditorIcon->SetupAttachment(SceneRoot);
+	EditorIcon->bIsScreenSizeScaled = true;
+
+	SpawnAreaBox = CreateDefaultSubobject<UBoxComponent>(TEXT("SpawnAreaBox"));
+	SpawnAreaBox->SetupAttachment(SceneRoot);
+	SpawnAreaBox->SetBoxExtent(FVector(1000.0f, 1000.0f, 200.0f));
+	SpawnAreaBox->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SpawnAreaBox->SetCollisionResponseToAllChannels(ECR_Ignore);
+	SpawnAreaBox->ShapeColor = AreaBoxColor;
+	SpawnAreaBox->SetLineThickness(AreaLineThickness);
+	SpawnAreaBox->bDrawOnlyIfSelected = false;
+
+	static ConstructorHelpers::FClassFinder<ATrapBase> BearTrapBPClass(TEXT("/Game/05_JYH/Trap/BP_Trap_BearTrap"));
+	if (BearTrapBPClass.Succeeded())
+	{
+		TrapClasses.Add(BearTrapBPClass.Class);
+	}
+	else
+	{
+		TrapClasses.Add(ATrapBearTrap::StaticClass());
+	}
+
+	static ConstructorHelpers::FClassFinder<ATrapBase> ElectricPanelBPClass(TEXT("/Game/05_JYH/Trap/BP_Trap_ElectricPanel"));
+	if (ElectricPanelBPClass.Succeeded())
+	{
+		TrapClasses.Add(ElectricPanelBPClass.Class);
+	}
+	else
+	{
+		TrapClasses.Add(ATrapElectricPanel::StaticClass());
+	}
+}
+
+void ATrapSpawner::OnConstruction(const FTransform& Transform)
+{
+	Super::OnConstruction(Transform);
+
+	if (SpawnAreaBox)
+	{
+		SpawnAreaBox->ShapeColor = AreaBoxColor;
+		SpawnAreaBox->SetLineThickness(AreaLineThickness);
+		SpawnAreaBox->MarkRenderStateDirty();
+	}
+}
+
+void ATrapSpawner::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (!HasAuthority() || !bAutoSpawnOnBeginPlay)
+	{
+		return;
+	}
+
+	if (AutoSpawnDelay > 0.0f)
+	{
+		GetWorldTimerManager().SetTimer(
+			AutoSpawnTimerHandle,
+			this,
+			&ATrapSpawner::SpawnTraps,
+			AutoSpawnDelay,
+			false
+		);
+	}
+	else
+	{
+		SpawnTraps();
+	}
+}
+
+void ATrapSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(AutoSpawnTimerHandle);
+	}
+
+	Super::EndPlay(EndPlayReason);
+}
+
+void ATrapSpawner::SpawnTraps()
+{
+	UWorld* World = GetWorld();
+	if (!World || !IsValid(SpawnAreaBox))
+	{
+		return;
+	}
+
+	if (World->IsGameWorld() && !HasAuthority())
+	{
+		return;
+	}
+
+	ClearSpawnedTraps();
+
+	const FBox Bounds = SpawnAreaBox->Bounds.GetBox();
+
+	for (int32 Index = 0; Index < TotalTrapCount; ++Index)
+	{
+		bool bFoundLocation = false;
+		FTransform SpawnTransform;
+		FHitResult FoundFloorHit;
+
+		for (int32 Attempt = 0; Attempt < MaxSpawnAttemptsPerTrap; ++Attempt)
+		{
+			const FVector RandomPoint = GetRandomPointInSpawnBox();
+			const FVector TraceStart(RandomPoint.X, RandomPoint.Y, Bounds.Max.Z);
+			const FVector TraceEnd(RandomPoint.X, RandomPoint.Y, Bounds.Min.Z - BottomTraceMargin);
+
+			FHitResult ValidFloorHit;
+			if (!FindFloorHit(TraceStart, TraceEnd, ValidFloorHit))
+			{
+				continue;
+			}
+			FoundFloorHit = ValidFloorHit;
+
+			const FVector SurfaceNormal = ValidFloorHit.ImpactNormal;
+			const FVector CandidateLocation = ValidFloorHit.ImpactPoint + (SurfaceNormal * FloorClearanceOffset);
+
+			if (!IsLocationFarEnoughFromExisting(CandidateLocation))
+			{
+				continue;
+			}
+
+			FRotator SpawnRotation = FRotator(0.0f, FMath::RandRange(0.0f, 360.0f), 0.0f);
+			if (bAlignToFloorNormal)
+			{
+				const FVector RandomDirection = SpawnRotation.Vector();
+				FVector ForwardDir = FVector::VectorPlaneProject(RandomDirection, SurfaceNormal).GetSafeNormal();
+				if (ForwardDir.IsNearlyZero())
+				{
+					ForwardDir = FVector::VectorPlaneProject(FVector::ForwardVector, SurfaceNormal).GetSafeNormal();
+				}
+				const FVector RightDir = FVector::CrossProduct(SurfaceNormal, ForwardDir).GetSafeNormal();
+				const FMatrix RotationMatrix(ForwardDir, RightDir, SurfaceNormal, FVector::ZeroVector);
+				SpawnRotation = RotationMatrix.Rotator();
+			}
+
+			SpawnTransform.SetLocation(CandidateLocation);
+			SpawnTransform.SetRotation(SpawnRotation.Quaternion());
+			SpawnTransform.SetScale3D(FVector::OneVector);
+
+			bFoundLocation = true;
+			break;
+		}
+
+		if (!bFoundLocation)
+		{
+			continue;
+		}
+
+		const TSubclassOf<ATrapBase> SelectedClass = SelectRandomTrapClass();
+		if (!SelectedClass)
+		{
+			continue;
+		}
+
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = this;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+		ATrapBase* NewTrap = World->SpawnActor<ATrapBase>(SelectedClass, SpawnTransform, SpawnParams);
+		if (IsValid(NewTrap))
+		{
+			if (NewTrap->GetRootComponent() && NewTrap->GetRootComponent()->Mobility != EComponentMobility::Movable)
+			{
+				NewTrap->GetRootComponent()->SetMobility(EComponentMobility::Movable);
+			}
+
+			TArray<UPrimitiveComponent*> PrimitiveComponents;
+			NewTrap->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+			for (UPrimitiveComponent* Prim : PrimitiveComponents)
+			{
+				if (IsValid(Prim) && Prim->IsSimulatingPhysics())
+				{
+					Prim->SetSimulatePhysics(false);
+				}
+			}
+
+			SnapTrapToFloor(NewTrap, FoundFloorHit.ImpactPoint, FoundFloorHit.ImpactNormal);
+			SpawnedTraps.Add(NewTrap);
+			SpawnedTrapLocations.Add(NewTrap->GetActorLocation());
+		}
+	}
+
+	if (bShowSpawnDebugInfo)
+	{
+		TMap<FString, int32> ClassCounts;
+		for (const TObjectPtr<ATrapBase>& Trap : SpawnedTraps)
+		{
+			if (IsValid(Trap))
+			{
+				const FString ClassName = Trap->GetClass()->GetName();
+				ClassCounts.FindOrAdd(ClassName)++;
+			}
+		}
+
+		const int32 SuccessCount = SpawnedTraps.Num();
+		const int32 FailedCount = FMath::Max(0, TotalTrapCount - SuccessCount);
+
+		FString DetailsString;
+		for (const auto& Pair : ClassCounts)
+		{
+			DetailsString += FString::Printf(TEXT("\n   - %s: %d개"), *Pair.Key, Pair.Value);
+		}
+
+		const FString SummaryMessage = FString::Printf(
+			TEXT("[TrapSpawner - %s] 스폰 완료 | 목표: %d개, 성공: %d개, 실패: %d개%s"),
+			*GetName(),
+			TotalTrapCount,
+			SuccessCount,
+			FailedCount,
+			*DetailsString
+		);
+
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *SummaryMessage);
+
+		if (GEngine)
+		{
+			const FColor MsgColor = (FailedCount == 0) ? FColor::Green : FColor::Orange;
+			GEngine->AddOnScreenDebugMessage(-1, DebugDrawDuration, MsgColor, SummaryMessage);
+		}
+
+		if (bDrawDebugVisuals && World)
+		{
+			for (int32 i = 0; i < SpawnedTraps.Num() && i < SpawnedTrapLocations.Num(); ++i)
+			{
+				if (IsValid(SpawnedTraps[i]))
+				{
+					const FVector Loc = SpawnedTrapLocations[i];
+					const FString TrapName = SpawnedTraps[i]->GetClass()->GetName();
+					DrawDebugSphere(World, Loc, 30.0f, 12, FColor::Cyan, false, DebugDrawDuration, 0, 2.0f);
+					DrawDebugString(World, Loc + FVector(0.0f, 0.0f, 40.0f), TrapName, nullptr, FColor::Yellow, DebugDrawDuration, true, 1.2f);
+				}
+			}
+		}
+	}
+}
+
+void ATrapSpawner::ClearSpawnedTraps()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	if (World->IsGameWorld() && !HasAuthority())
+	{
+		return;
+	}
+
+	for (const TObjectPtr<ATrapBase>& Trap : SpawnedTraps)
+	{
+		if (IsValid(Trap))
+		{
+			Trap->SetActorEnableCollision(false);
+#if WITH_EDITOR
+			if (!World->IsGameWorld())
+			{
+				World->EditorDestroyActor(Trap, true);
+			}
+			else
+#endif
+			{
+				Trap->Destroy();
+			}
+		}
+	}
+	SpawnedTraps.Empty();
+	SpawnedTrapLocations.Empty();
+}
+
+void ATrapSpawner::DebugSpawnTrapsInEditor()
+{
+	SpawnTraps();
+}
+
+void ATrapSpawner::DebugClearTrapsInEditor()
+{
+	ClearSpawnedTraps();
+}
+
+TArray<ATrapBase*> ATrapSpawner::GetSpawnedTraps() const
+{
+	TArray<ATrapBase*> Result;
+	Result.Reserve(SpawnedTraps.Num());
+	for (const TObjectPtr<ATrapBase>& Trap : SpawnedTraps)
+	{
+		if (IsValid(Trap))
+		{
+			Result.Add(Trap.Get());
+		}
+	}
+	return Result;
+}
+
+bool ATrapSpawner::IsLocationFarEnoughFromExisting(const FVector& CandidateLocation) const
+{
+	const float MinDistSq = FMath::Square(MinDistanceBetweenTraps);
+	for (const FVector& Location : SpawnedTrapLocations)
+	{
+		const float DistSq = bUse2DDistanceCheck
+			? FVector::DistSquared2D(CandidateLocation, Location)
+			: FVector::DistSquared(CandidateLocation, Location);
+
+		if (DistSq < MinDistSq)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+TSubclassOf<ATrapBase> ATrapSpawner::SelectRandomTrapClass() const
+{
+	TArray<TSubclassOf<ATrapBase>> ValidClasses;
+	for (const TSubclassOf<ATrapBase>& ClassCandidate : TrapClasses)
+	{
+		if (ClassCandidate)
+		{
+			ValidClasses.Add(ClassCandidate);
+		}
+	}
+
+	if (ValidClasses.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const int32 RandomIndex = FMath::RandRange(0, ValidClasses.Num() - 1);
+	return ValidClasses[RandomIndex];
+}
+
+void ATrapSpawner::RemoveInvalidSpawnedTraps()
+{
+	SpawnedTraps.RemoveAll([](const TObjectPtr<ATrapBase>& Trap)
+	{
+		return !IsValid(Trap);
+	});
+}
+
+FVector ATrapSpawner::GetRandomPointInSpawnBox() const
+{
+	const FVector Extent = SpawnAreaBox->GetUnscaledBoxExtent();
+	const FVector LocalPoint(FMath::RandRange(-Extent.X, Extent.X), FMath::RandRange(-Extent.Y, Extent.Y), 0.0f);
+	return SpawnAreaBox->GetComponentTransform().TransformPosition(LocalPoint);
+}
+
+bool ATrapSpawner::FindFloorHit(const FVector& TraceStart, const FVector& TraceEnd, FHitResult& OutHit) const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(TrapSpawnerGroundTrace), true, this);
+	for (const TObjectPtr<ATrapBase>& ExistingTrap : SpawnedTraps)
+	{
+		if (IsValid(ExistingTrap))
+		{
+			QueryParams.AddIgnoredActor(ExistingTrap);
+		}
+	}
+
+	FCollisionObjectQueryParams ObjectQueryParams;
+	ObjectQueryParams.AddObjectTypesToQuery(ECC_WorldStatic);
+	ObjectQueryParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+
+	TArray<FHitResult> HitResults;
+	World->LineTraceMultiByObjectType(HitResults, TraceStart, TraceEnd, ObjectQueryParams, QueryParams);
+
+	if (HitResults.IsEmpty())
+	{
+		World->LineTraceMultiByChannel(HitResults, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
+	}
+
+	for (int32 HitIndex = HitResults.Num() - 1; HitIndex >= 0; --HitIndex)
+	{
+		const FHitResult& Hit = HitResults[HitIndex];
+		AActor* HitActor = Hit.GetActor();
+		if (!Hit.bBlockingHit || !HitActor || HitActor == this
+			|| HitActor->IsA<ATrapBase>() || HitActor->IsA<AVolume>() || HitActor->IsA<APawn>())
+		{
+			continue;
+		}
+
+		if (Hit.ImpactNormal.Z < MinFloorNormalZ)
+		{
+			continue;
+		}
+
+		const UPrimitiveComponent* HitComp = Hit.GetComponent();
+		if (!HitComp || HitComp->CanCharacterStepUpOn == ECB_No)
+		{
+			continue;
+		}
+
+		const FString CompName = HitComp->GetName();
+		const FString ActorName = HitActor->GetName();
+		if (CompName.Contains(TEXT("Grass"), ESearchCase::IgnoreCase) ||
+			CompName.Contains(TEXT("Foliage"), ESearchCase::IgnoreCase) ||
+			CompName.Contains(TEXT("Plant"), ESearchCase::IgnoreCase) ||
+			CompName.Contains(TEXT("Flower"), ESearchCase::IgnoreCase) ||
+			ActorName.Contains(TEXT("Grass"), ESearchCase::IgnoreCase) ||
+			ActorName.Contains(TEXT("Foliage"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		const FVector LocalHitPoint = SpawnAreaBox->GetComponentTransform().InverseTransformPosition(Hit.ImpactPoint);
+		const FVector BoxExtent = SpawnAreaBox->GetUnscaledBoxExtent();
+		if (FMath::Abs(LocalHitPoint.X) > BoxExtent.X ||
+			FMath::Abs(LocalHitPoint.Y) > BoxExtent.Y ||
+			LocalHitPoint.Z > BoxExtent.Z + FloorClearanceOffset ||
+			LocalHitPoint.Z < -(BoxExtent.Z + BottomTraceMargin))
+		{
+			continue;
+		}
+		OutHit = Hit;
+		return true;
+	}
+
+	return false;
+}
+
+void ATrapSpawner::SnapTrapToFloor(ATrapBase* Trap, const FVector& FloorPoint, const FVector& SurfaceNormal) const
+{
+	if (!IsValid(Trap))
+	{
+		return;
+	}
+
+	TArray<UMeshComponent*> MeshComponents;
+	Trap->GetComponents<UMeshComponent>(MeshComponents);
+
+	bool bHasMesh = false;
+	float LocalLowestZ = 0.0f;
+
+	for (const UMeshComponent* MeshComp : MeshComponents)
+	{
+		if (IsValid(MeshComp) && MeshComp->IsVisible())
+		{
+			const FBoxSphereBounds LocalBounds = MeshComp->CalcBounds(FTransform::Identity);
+			const float BottomZ = LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z;
+			LocalLowestZ = bHasMesh ? FMath::Min(LocalLowestZ, BottomZ) : BottomZ;
+			bHasMesh = true;
+		}
+	}
+
+	if (!bHasMesh)
+	{
+		return;
+	}
+
+	const float DesiredNormalOffset = FloorClearanceOffset - LocalLowestZ;
+	const FVector TargetLocation = FloorPoint + (SurfaceNormal * DesiredNormalOffset);
+	Trap->SetActorLocation(TargetLocation, false, nullptr, ETeleportType::TeleportPhysics);
+}

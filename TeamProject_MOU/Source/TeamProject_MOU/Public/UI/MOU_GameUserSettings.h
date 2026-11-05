@@ -1,0 +1,161 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/GameUserSettings.h"
+#include "InputCoreTypes.h"
+#include "MOU_GameUserSettings.generated.h"
+
+class USoundClass;
+
+DECLARE_MULTICAST_DELEGATE(FOnMOUAudioSettingsChanged);
+DECLARE_MULTICAST_DELEGATE(FOnMOUControlSettingsChanged);
+
+/**
+ * 프로젝트 전용 게임 사용자 설정 클래스.
+ * 엔진의 UGameUserSettings를 확장하여 그래픽(스케일러빌리티/해상도/화면모드/VSync/FPS제한),
+ * 오디오(Master, BGM, SFX, Voice, 마이크 감도), 조작(마우스 감도, Y축 반전, FOV, 키 리매핑)을
+ * GameUserSettings.ini 한 곳에 일괄 영구 저장 및 관리합니다.
+ */
+UCLASS()
+class TEAMPROJECT_MOU_API UMOU_GameUserSettings : public UGameUserSettings
+{
+	GENERATED_BODY()
+
+public:
+	// [MIC-007] 음성 출력과 마이크 인식 임계값의 기본 설정을 초기화한다.
+	UMOU_GameUserSettings();
+
+	/** 싱글톤 인스턴스 헬퍼 */
+	UFUNCTION(BlueprintPure, Category = "Settings")
+	static UMOU_GameUserSettings* GetMOUGameUserSettings();
+
+	// [MIC-008] 기본 설정 및 음성 설정 버전을 복원한다.
+	virtual void SetToDefaults() override;
+	virtual void ApplyNonResolutionSettings() override;
+	// [MIC-002] 기존 설정을 읽고 구버전 음성 볼륨과 마이크 임계값을 한 번 보정한다.
+	virtual void LoadSettings(bool bForceReload = false) override;
+
+	// =========================================================================
+	// [오디오 설정]
+	// =========================================================================
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Audio")
+	float GetMasterVolume() const { return MasterVolume; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio")
+	void SetMasterVolume(float InVolume);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Audio")
+	float GetBGMVolume() const { return BGMVolume; }
+
+	// [BGMAUDIO-001] 배경음악 볼륨을 저장하고 공통 BGM 사운드 클래스에 즉시 반영한다.
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio")
+	void SetBGMVolume(float InVolume);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Audio")
+	float GetSFXVolume() const { return SFXVolume; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio")
+	void SetSFXVolume(float InVolume);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Audio")
+	float GetVoiceVolume() const { return VoiceVolume; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio")
+	// [VOICEVOL-001] 수신 음성 배율을 0~200% 범위로 저장하고 즉시 변경을 알린다.
+	void SetVoiceVolume(float InVolume);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Audio")
+	float GetMicSensitivity() const { return MicSensitivity; }
+
+	// [MIC-003] 수동 마이크 임계값을 0~0.01로 제한하고 캡처에 적용한다.
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio")
+	void SetMicSensitivity(float InSensitivity);
+
+	/** 오디오 시스템 및 서브시스템에 볼륨 설정 적용 */
+	// [BGMAUDIO-002] 마스터 볼륨, 공통 BGM 볼륨과 마이크 감도를 적용한다.
+	UFUNCTION(BlueprintCallable, Category = "Settings|Audio", meta = (WorldContext = "WorldContextObject"))
+	void ApplyAudioSettings(UObject* WorldContextObject);
+
+	FOnMOUAudioSettingsChanged OnAudioSettingsChanged;
+
+	// =========================================================================
+	// [조작 및 화면 설정]
+	// =========================================================================
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Controls")
+	float GetMouseSensitivity() const { return MouseSensitivity; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Controls")
+	void SetMouseSensitivity(float InSensitivity);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Controls")
+	bool GetInvertY() const { return bInvertY; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Controls")
+	void SetInvertY(bool bInInvert);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Controls")
+	float GetFieldOfView() const { return FieldOfView; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Controls")
+	void SetFieldOfView(float InFOV);
+
+	FOnMOUControlSettingsChanged OnControlSettingsChanged;
+
+	// =========================================================================
+	// [키 바인딩 설정]
+	// =========================================================================
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Input")
+	void SetCustomKeyBinding(FName ActionName, const FKey& Key);
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Input")
+	FKey GetCustomKeyBinding(FName ActionName, const FKey& DefaultKey) const;
+
+	UFUNCTION(BlueprintPure, Category = "Settings|Input")
+	const TMap<FName, FKey>& GetAllCustomKeyBindings() const { return CustomKeyBindings; }
+
+	UFUNCTION(BlueprintCallable, Category = "Settings|Input")
+	void ClearAllCustomKeyBindings();
+
+protected:
+	// 실행 중 사용하는 공통 BGM 사운드 클래스 참조
+	UPROPERTY(Transient)
+	TObjectPtr<USoundClass> BGMSoundClass;
+
+	// --- 오디오 저장 변수 ---
+	UPROPERTY(Config)
+	float MasterVolume = 0.5f;
+
+	UPROPERTY(Config)
+	float BGMVolume = 0.5f;
+
+	UPROPERTY(Config)
+	float SFXVolume = 0.5f;
+
+	UPROPERTY(Config)
+	float VoiceVolume = 1.0f;
+
+	UPROPERTY(Config)
+	float MicSensitivity = 0.005f;
+
+	// --- 조작 저장 변수 ---
+	UPROPERTY(Config)
+	float MouseSensitivity = 1.0f;
+
+	UPROPERTY(Config)
+	bool bInvertY = false;
+
+	UPROPERTY(Config)
+	float FieldOfView = 90.0f;
+
+	// --- 키 바인딩 저장 (ActionName -> Key) ---
+	UPROPERTY(Config)
+	TMap<FName, FKey> CustomKeyBindings;
+
+	UPROPERTY(Config)
+	int32 MOUSettingsVersion = 0;
+};

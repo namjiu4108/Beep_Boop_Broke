@@ -1,0 +1,244 @@
+#include "UI/MOU_CharacterStatusHUD.h"
+#include "UI/ThrowChargeWidget.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/Image.h"
+#include "Components/ProgressBar.h"
+#include "Engine/Texture2D.h"
+#include "Math/UnrealMathUtility.h"
+#include "Player/MainCharacter.h"
+#include "Base/BaseAttributeSet.h"
+#include "GameFramework/PlayerController.h"
+
+void UMOU_CharacterStatusHUD::NativeConstruct()
+{
+	Super::NativeConstruct();
+
+	// Initial State Update
+	SetPortraitTextureByState(ECharacterStatusState::Happy);
+
+	// 던지기 차징 위젯 초기 비활성화
+	if (UThrowChargeWidget* TargetWidget = GetThrowChargeWidget())
+	{
+		TargetWidget->SetChargingState(false);
+	}
+}
+
+void UMOU_CharacterStatusHUD::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+
+	if (BoundCharacter.IsValid())
+	{
+		if (UBaseAttributeSet* Attr = BoundCharacter->BaseAttribute)
+		{
+			const float MaxHP = FMath::Max(1.0f, Attr->GetMaxHealth());
+			const float CurrentHP = FMath::Clamp(Attr->GetHealth(), 0.0f, MaxHP);
+			SetTargetHP(CurrentHP / MaxHP);
+
+			const float MaxStamina = FMath::Max(1.0f, Attr->GetMaxStemina());
+			const float CurrentStamina = FMath::Clamp(Attr->GetStemina(), 0.0f, MaxStamina);
+			SetTargetStamina(CurrentStamina / MaxStamina);
+		}
+	}
+
+	bool bHPUpdated = false;
+
+	// Catch-Up effect for HP
+	if (!FMath::IsNearlyEqual(CurrentHPPercent, TargetHPPercent, 0.001f))
+	{
+		CurrentHPPercent = FMath::FInterpTo(CurrentHPPercent, TargetHPPercent, InDeltaTime, CatchUpInterpSpeed);
+		
+		if (ProgressBar_HP)
+		{
+			ProgressBar_HP->SetPercent(CurrentHPPercent);
+		}
+		
+		bHPUpdated = true;
+	}
+	else if (CurrentHPPercent != TargetHPPercent)
+	{
+		// 목표치 도달 시 정확한 값으로 스냅 (0.0009f 등에 머무는 현상 방지)
+		CurrentHPPercent = TargetHPPercent;
+		if (ProgressBar_HP)
+		{
+			ProgressBar_HP->SetPercent(CurrentHPPercent);
+		}
+		bHPUpdated = true;
+	}
+
+	// Catch-Up effect for Stamina
+	if (!FMath::IsNearlyEqual(CurrentStaminaPercent, TargetStaminaPercent, 0.001f))
+	{
+		CurrentStaminaPercent = FMath::FInterpTo(CurrentStaminaPercent, TargetStaminaPercent, InDeltaTime, CatchUpInterpSpeed);
+		
+		if (ProgressBar_Stamina)
+		{
+			ProgressBar_Stamina->SetPercent(CurrentStaminaPercent);
+		}
+	}
+	else if (CurrentStaminaPercent != TargetStaminaPercent)
+	{
+		CurrentStaminaPercent = TargetStaminaPercent;
+		if (ProgressBar_Stamina)
+		{
+			ProgressBar_Stamina->SetPercent(CurrentStaminaPercent);
+		}
+	}
+
+	// Only update portrait state if HP has visually changed
+	if (bHPUpdated)
+	{
+		UpdatePortraitState(CurrentHPPercent);
+	}
+}
+
+void UMOU_CharacterStatusHUD::SetTargetHP(float NewHPPercent)
+{
+	TargetHPPercent = FMath::Clamp(NewHPPercent, 0.0f, 1.0f);
+}
+
+void UMOU_CharacterStatusHUD::SetTargetStamina(float NewStaminaPercent)
+{
+	TargetStaminaPercent = FMath::Clamp(NewStaminaPercent, 0.0f, 1.0f);
+}
+
+void UMOU_CharacterStatusHUD::ForceUpdateStatus(float NewHPPercent, float NewStaminaPercent)
+{
+	TargetHPPercent = FMath::Clamp(NewHPPercent, 0.0f, 1.0f);
+	CurrentHPPercent = TargetHPPercent;
+	
+	TargetStaminaPercent = FMath::Clamp(NewStaminaPercent, 0.0f, 1.0f);
+	CurrentStaminaPercent = TargetStaminaPercent;
+
+	if (ProgressBar_HP)
+	{
+		ProgressBar_HP->SetPercent(CurrentHPPercent);
+	}
+
+	if (ProgressBar_Stamina)
+	{
+		ProgressBar_Stamina->SetPercent(CurrentStaminaPercent);
+	}
+
+	UpdatePortraitState(CurrentHPPercent);
+}
+
+void UMOU_CharacterStatusHUD::BindToCharacter(AMainCharacter* InCharacter)
+{
+	BoundCharacter = InCharacter;
+	if (InCharacter && InCharacter->BaseAttribute)
+	{
+		UBaseAttributeSet* Attr = InCharacter->BaseAttribute;
+		const float MaxHP = FMath::Max(1.0f, Attr->GetMaxHealth());
+		const float CurrentHP = FMath::Clamp(Attr->GetHealth(), 0.0f, MaxHP);
+		const float MaxStamina = FMath::Max(1.0f, Attr->GetMaxStemina());
+		const float CurrentStamina = FMath::Clamp(Attr->GetStemina(), 0.0f, MaxStamina);
+		ForceUpdateStatus(CurrentHP / MaxHP, CurrentStamina / MaxStamina);
+	}
+}
+
+void UMOU_CharacterStatusHUD::UpdatePortraitState(float InCurrentHP)
+{
+	ECharacterStatusState NewState;
+
+	if (InCurrentHP <= 0.0f)
+	{
+		NewState = ECharacterStatusState::Offline; // Groggy or Dead
+	}
+	else if (InCurrentHP <= 0.25f)
+	{
+		NewState = ECharacterStatusState::Critical; // 0+ ~ 25
+	}
+	else if (InCurrentHP <= 0.50f)
+	{
+		NewState = ECharacterStatusState::Warning; // 25+ ~ 50
+	}
+	else if (InCurrentHP <= 0.75f)
+	{
+		NewState = ECharacterStatusState::OK; // 50+ ~ 75
+	}
+	else
+	{
+		NewState = ECharacterStatusState::Happy; // 75+ ~ 100
+	}
+
+	if (NewState != CurrentState)
+	{
+		SetPortraitTextureByState(NewState);
+		CurrentState = NewState;
+	}
+}
+
+void UMOU_CharacterStatusHUD::SetPortraitTextureByState(ECharacterStatusState NewState)
+{
+	UTexture2D* TargetPortrait = nullptr;
+
+	switch (NewState)
+	{
+		case ECharacterStatusState::Happy:
+			TargetPortrait = Tex_Happy;
+			break;
+		case ECharacterStatusState::OK:
+			TargetPortrait = Tex_OK;
+			break;
+		case ECharacterStatusState::Warning:
+			TargetPortrait = Tex_Warning;
+			break;
+		case ECharacterStatusState::Critical:
+			TargetPortrait = Tex_Critical;
+			break;
+		case ECharacterStatusState::Offline:
+			TargetPortrait = Tex_Offline;
+			break;
+	}
+
+	if (Image_CenterPortrait && TargetPortrait)
+	{
+		Image_CenterPortrait->SetBrushFromTexture(TargetPortrait);
+	}
+}
+
+UThrowChargeWidget* UMOU_CharacterStatusHUD::GetThrowChargeWidget()
+{
+	if (ThrowChargeWidget)
+	{
+		return ThrowChargeWidget;
+	}
+
+	if (ThrowChargeWiget)
+	{
+		ThrowChargeWidget = ThrowChargeWiget;
+		return ThrowChargeWidget;
+	}
+
+	if (WidgetTree)
+	{
+		WidgetTree->ForEachWidget([this](UWidget* Widget)
+		{
+			if (!ThrowChargeWidget)
+			{
+				if (UThrowChargeWidget* Found = Cast<UThrowChargeWidget>(Widget))
+				{
+					ThrowChargeWidget = Found;
+				}
+			}
+		});
+	}
+
+	return ThrowChargeWidget;
+}
+
+void UMOU_CharacterStatusHUD::UpdateThrowCharge(bool bIsCharging, float ChargeRatio)
+{
+	UThrowChargeWidget* TargetWidget = GetThrowChargeWidget();
+	if (TargetWidget)
+	{
+		TargetWidget->SetChargingState(bIsCharging);
+		if (bIsCharging)
+		{
+			TargetWidget->UpdateCharge(ChargeRatio);
+		}
+	}
+
+	OnThrowChargeUpdated(bIsCharging, ChargeRatio);
+}
