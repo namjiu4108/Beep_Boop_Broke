@@ -1,0 +1,112 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Item/WeaponItemBase.h"
+#include "TaserGun.generated.h"
+
+class USceneComponent;
+class USoundBase;
+class UNiagaraSystem;
+
+/**
+ * ATaserGun
+ * 전투 아이템 - 테이저건 (원거리 즉발 무기). 좌클릭(OnUse) 시 카메라 조준 방향으로
+ * 피아식별 트레이스(WeaponItemBase::FireHitscan)를 발사해 맞은 캐릭터를
+ * 일정 시간 감전(State.CC.Electirc) 상태로 만든다.
+ * 전기 이펙트(VFX)는 블루프린트에서 BlueprintImplementableEvent로 처리.
+ */
+UCLASS()
+class TEAMPROJECT_MOU_API ATaserGun : public AWeaponItemBase
+{
+	GENERATED_BODY()
+
+public:
+	// [TASER-008] 초기 컴포넌트와 기본값 설정
+	ATaserGun();
+
+#pragma region [TASER] 컴포넌트
+	// 총구 지점. BP에서 메시의 총구 위치로 옮겨두면 VFX가 여기서 시작한다.
+	// (StaticMesh라 소켓이 없어 별도 컴포넌트로 총구 위치를 잡음)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Taser")
+	TObjectPtr<USceneComponent> MuzzlePoint;
+#pragma endregion
+
+#pragma region [TASER] 설정값
+	// 트레이스 사거리 (cm) - 카메라 시점 기준 전방
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Taser")
+	float TraceDistance = 1500.0f;
+
+	// 맞은 대상의 기절 지속 시간 (초)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Taser")
+	float StunDuration = 3.0f;
+
+	// 발사 시 총구 위치에서 재생할 테이저 효과음
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Taser|Audio")
+	TObjectPtr<USoundBase> FireSound;
+
+	// 테이저 발사음 볼륨
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Taser|Audio", meta = (ClampMin = "0.0"))
+	float FireSoundVolume = 1.0f;
+
+	// 총구에서 도착점까지 표시할 Niagara 빔 이펙트
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Taser|FX")
+	TObjectPtr<UNiagaraSystem> FireEffect;
+#pragma endregion
+
+#pragma region [TASER] 사용/발사
+	// [TASER-012] 발사한 클라이언트의 실제 카메라 위치와 방향을 서버에 전달한다.
+	virtual void OnUse_Implementation() override;
+
+	// TASER-001 발사 override: 카메라 조준 방향으로 피아식별 트레이스 + VFX
+	// (좌클릭→횟수차감→서버권한 분기는 부모 WeaponItemBase가 처리)
+	// [TASER-001] 서버에서 무기 사용과 발사 처리
+	virtual void Fire() override;
+
+	// TASER-007 발사 1회당 내구도 25 차감 (명중 무관). 최대 100이라 4번 쏘면 소진. WEAPON-014
+	// [TASER-007] 발사 1회당 내구도 25 차감 (명중 무관). 최대 100이라 4번 쏘면 소진. WEAPON-014
+	virtual float GetDurabilityCostPerUse() const override { return 25.0f; }
+
+	// 테이저는 발사 후 짧은 쿨(FireCooldown) 동안 "사용 중"이라 슬롯 변경을 막는다. WEAPON-015
+	// [TASER-009] 발사 후 사용 중 상태 유지 여부 반환
+	virtual bool bUsesInUseState() const override { return true; }
+
+	// 발사 후 슬롯 잠금이 유지되는 시간 (초). 이 시간 뒤 FinishUse로 해제.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Taser")
+	float FireCooldown = 0.5f;
+
+private:
+	// [TASER-013] 클라이언트 카메라 기준의 발사 시점을 서버에서 검증한 후 발사한다.
+	UFUNCTION(Server, Reliable)
+	void ServerFireFromView(FVector_NetQuantize ViewLocation, FVector_NetQuantizeNormal ViewDirection);
+
+	// 현재 발사 1회에만 사용할, 서버가 검증한 조준 정보.
+	FVector ValidatedViewLocation = FVector::ZeroVector;
+	FVector ValidatedViewDirection = FVector::ForwardVector;
+	bool bHasValidatedView = false;
+
+	// 발사 쿨다운 타이머 핸들
+	FTimerHandle FireCooldownTimer;
+protected:
+
+	// TASER-006 무기 공통 히트 처리 override: 맞은 캐릭터에 기절 부여
+	// [TASER-006] 명중 대상의 효과 처리
+	virtual void ApplyWeaponHit_Implementation(AActor* HitActor, const FHitResult& Hit) override;
+#pragma endregion
+
+#pragma region [TASER] 연출 훅 (Blueprint VFX)
+	// TASER-005 발사 이펙트 훅 (전기 줄기 등). 시작/끝 지점 전달, 모든 클라 재생
+	UFUNCTION(NetMulticast, Unreliable)
+	// [TASER-005] 발사 이펙트 훅 (전기 줄기 등). 시작/끝 지점 전달, 모든 클라 재생
+	void MulticastPlayFireEffect(FVector Start, FVector End, bool bHit);
+
+	// [TASER-011] 모든 클라이언트에서 총구 위치에 테이저 발사음을 재생한다.
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastPlayFireSound();
+
+	// 블루프린트에서 실제 나이아가라/케이블 VFX를 붙이는 이벤트
+	UFUNCTION(BlueprintImplementableEvent, Category = "Taser|FX")
+	// [TASER-010] BP에서 구현하는 발사 연출 이벤트
+	void OnFireEffect(FVector Start, FVector End, bool bHit);
+#pragma endregion
+
+};

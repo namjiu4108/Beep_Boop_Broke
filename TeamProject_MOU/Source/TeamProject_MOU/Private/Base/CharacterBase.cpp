@@ -1,0 +1,665 @@
+#include "Base/CharacterBase.h"
+
+#include "Base/BaseAttributeSet.h"
+#include "Components/GrabFollowComponent.h"
+#include "Components/StatusComponent.h"
+#include "Components/CharacterVisualComponent.h"
+#include "Abilities/GameplayAbility.h"
+#include "Components/CapsuleComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Player/MainCharacter.h"
+#include "Components/CarryingComponent.h"
+
+ACharacterBase::ACharacterBase()
+{
+	PrimaryActorTick.bCanEverTick = false;
+
+	// GAS 어빌리티 시스템 컴포넌트 생성 및 네트워크 리플리케이션 설정
+	AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystemComponent"));
+	AbilitySystemComponent->SetIsReplicated(true);
+	AbilitySystemComponent->SetReplicationMode(AscReplicationMode);
+
+	// 플레이어 및 방해 NPC 공통 상태 관리 컴포넌트 생성
+	StatusComponent = CreateDefaultSubobject<UStatusComponent>(TEXT("StatusComponent"));
+
+	// 잡힌 캐릭터의 위치 및 회전을 운반자 소켓에 동기화하는 컴포넌트 생성
+	GrabFollowComponent = CreateDefaultSubobject<UGrabFollowComponent>(TEXT("GrabFollowComponent"));
+
+	// 비주얼(표정 및 LED 색상) 관리 컴포넌트 생성
+	VisualComponent = CreateDefaultSubobject<UCharacterVisualComponent>(TEXT("VisualComponent"));
+
+	// 캡슐 콜리전 기본 크기 설정
+	GetCapsuleComponent()->InitCapsuleSize(35.0f, 90.0f);
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+
+	// 컨트롤러 회전 사용 안 함 (캐릭터 이동 방향으로 자동 회전)
+	bUseControllerRotationPitch = false;
+	bUseControllerRotationYaw = false;
+	bUseControllerRotationRoll = false;
+
+	GetCharacterMovement()->bOrientRotationToMovement = true;
+	GetCharacterMovement()->RotationRate = FRotator(0.0f, 500.0f, 0.0f);
+
+	// 이동 물리 및 점프 관련 기본값 설정
+	GetCharacterMovement()->JumpZVelocity = 500.0f;
+	GetCharacterMovement()->AirControl = 0.35f;
+	GetCharacterMovement()->MaxWalkSpeed = 500.0f;
+	GetCharacterMovement()->MinAnalogWalkSpeed = 20.0f;
+	GetCharacterMovement()->BrakingDecelerationWalking = 2000.0f;
+	GetCharacterMovement()->BrakingDecelerationFalling = 1500.0f;
+	GetCharacterMovement()->bEnablePhysicsInteraction = false;
+
+	// 기본 AttributeSet 생성 및 등록
+	BaseAttribute = CreateDefaultSubobject<UBaseAttributeSet>(TEXT("AttributeSet"));
+	BaseAttributeSet.Add(BaseAttribute);
+}
+
+void ACharacterBase::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// ASC가 Character에 있으므로 서버와 모든 클라이언트에서 ActorInfo를 초기화합니다.
+	// AI NPC는 클라이언트에서 PlayerState가 없어 OnRep_PlayerState가 호출되지 않을 수 있습니다.
+	if (AbilitySystemComponent)
+	{
+		AbilitySystemComponent->InitAbilityActorInfo(this, this);
+		AbilitySystemComponent->SetReplicationMode(AscReplicationMode);
+	}
+
+	// Attribute 변경 감지 델리게이트 바인딩
+	BindAttributeChangeDelegates();
+}
+
+void ACharacterBase::PossessedBy(AController* NewController)
+{
+	Super::PossessedBy(NewController);
+
+	if (AbilitySystemComponent)
+	{
+		// 서버 환경: GAS 어빌리티 정보 초기화 및 초기 스킬 부여
+		AbilitySystemComponent->InitAbilityActorInfo(this, this);
+		InitializeAbilityMulti(InitalAbilities, 1);
+		BindAttributeChangeDelegates();
+	}
+}
+
+void ACharacterBase::OnRep_PlayerState()
+{
+	Super::OnRep_PlayerState();
+
+	if (AbilitySystemComponent)
+	{
+		// 클라이언트 환경: GAS 어빌리티 정보 초기화
+		AbilitySystemComponent->InitAbilityActorInfo(this, this);
+		BindAttributeChangeDelegates();
+	}
+}
+
+void ACharacterBase::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+}
+
+void ACharacterBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
+}
+
+void ACharacterBase::DoMove(float Right, float Forward)
+{
+	if (!CanMove())
+	{
+		return;
+	}
+
+	Super::DoMove(Right, Forward);
+}
+
+void ACharacterBase::DoJumpStart()
+{
+	if (!CanMove())
+	{
+		return;
+	}
+
+	Super::DoJumpStart();
+}
+
+UAbilitySystemComponent* ACharacterBase::GetAbilitySystemComponent() const
+{
+	return AbilitySystemComponent;
+}
+
+bool ACharacterBase::CanMove() const
+{
+	// StatusComponent를 이용해 이동 가능 상태(기절/잡힘/넉백 없음) 확인
+	if (StatusComponent)
+	{
+		return StatusComponent->CanMove();
+	}
+
+	return true;
+}
+
+bool ACharacterBase::CanAct() const
+{
+	// StatusComponent를 이용해 행동 가능 상태(기절/잡힘 없음) 확인
+	if (StatusComponent)
+	{
+		return StatusComponent->CanAct();
+	}
+
+	return true;
+}
+
+FGameplayAbilitySpecHandle ACharacterBase::InitializeAbility(TSubclassOf<UGameplayAbility> AbilityToGet, int32 AbilityLevel)
+{
+	if (HasAuthority() && AbilitySystemComponent && AbilityToGet)
+	{
+		return AbilitySystemComponent->GiveAbility(FGameplayAbilitySpec(AbilityToGet, AbilityLevel));
+	}
+
+	return FGameplayAbilitySpecHandle();
+}
+
+void ACharacterBase::InitializeAbilityMulti(TArray<TSubclassOf<UGameplayAbility>> AbilityToAcquire, int32 AbilityLevel)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	for (const TSubclassOf<UGameplayAbility>& AbilityItem : AbilityToAcquire)
+	{
+		if (AbilityItem)
+		{
+			InitializeAbility(AbilityItem, AbilityLevel);
+		}
+	}
+}
+
+void ACharacterBase::BindAttributeChangeDelegates()
+{
+	if (AttributeDelegatesBound || !AbilitySystemComponent || !BaseAttribute)
+	{
+		return;
+	}
+
+	AttributeDelegatesBound = true;
+
+	// 체력(Health) 변경 델리게이트 바인딩
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetHealthAttribute())
+		.AddUObject(this, &ACharacterBase::HandleHealthChanged);
+
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMaxHealthAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMaxHealthChanged);
+
+	// 스태미나(Stemina) 변경 델리게이트 바인딩
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetSteminaAttribute())
+		.AddUObject(this, &ACharacterBase::HandleSteminaChanged);
+
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMaxSteminaAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMaxSteminaChanged);
+
+	// 이동속도(MoveSpeed) 변경 델리게이트 바인딩
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMoveSpeedAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMoveSpeedChanged);
+
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMaxMoveSpeedAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMaxMoveSpeedChanged);
+
+	// 무게 변경 델리게이트 바인딩
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetCurrentWeightAttribute())
+		.AddUObject(this, &ACharacterBase::HandleCurrentWeightChanged);
+
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMaxWeightAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMaxWeightChanged);
+
+	// 배터리 변경 델리게이트 바인딩
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetBatteryAttribute())
+		.AddUObject(this, &ACharacterBase::HandleBatteryChanged);
+
+	AbilitySystemComponent
+		->GetGameplayAttributeValueChangeDelegate(UBaseAttributeSet::GetMaxBatteryAttribute())
+		.AddUObject(this, &ACharacterBase::HandleMaxBatteryChanged);
+
+	// 초기 속도 값 동기화
+	if (GetCharacterMovement())
+	{
+		GetCharacterMovement()->MaxWalkSpeed = BaseAttribute->GetMoveSpeed();
+	}
+}
+
+void ACharacterBase::HandleHealthChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute)
+	{
+		return;
+	}
+
+	// 체력 감소(대미지 피격) 시 피격 표정/LED 반응 자동 실행 (사망/그로기 상태 제외)
+	if (Data.NewValue < Data.OldValue && Data.NewValue > 0.0f)
+	{
+		if (AMainCharacter* MainChar = Cast<AMainCharacter>(this))
+		{
+			MainChar->PlayHitReaction(0.4f);
+		}
+		else if (VisualComponent)
+		{
+			static const FGameplayTag HitTag = FGameplayTag::RequestGameplayTag(FName("State.Player.HitReaction"), false);
+			VisualComponent->SetTagTemporaryOverride(HitTag, 0.4f);
+		}
+	}
+
+	// 체력 변경 시 Blueprint 이벤트 호출 (UI 업데이트)
+	OnHealthUpdated(BaseAttribute->GetHealth(), BaseAttribute->GetMaxHealth());
+}
+
+void ACharacterBase::HandleMaxHealthChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute)
+	{
+		return;
+	}
+
+	OnHealthUpdated(BaseAttribute->GetHealth(), BaseAttribute->GetMaxHealth());
+}
+
+void ACharacterBase::HandleSteminaChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute)
+	{
+		return;
+	}
+
+	// 스태미나 변경 시 Blueprint 이벤트 호출
+	OnSteminaupdated(BaseAttribute->GetStemina(), BaseAttribute->GetMaxStemina());
+}
+
+void ACharacterBase::HandleMaxSteminaChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute)
+	{
+		return;
+	}
+
+	OnSteminaupdated(BaseAttribute->GetStemina(), BaseAttribute->GetMaxStemina());
+}
+
+void ACharacterBase::HandleMoveSpeedChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute || !GetCharacterMovement())
+	{
+		return;
+	}
+
+	// 이동속도 속성 변경 시 CharacterMovement의 MaxWalkSpeed 동기화 (MaxMoveSpeed 상한치 준수)
+	float ClampedSpeed = FMath::Clamp(Data.NewValue, 0.0f, BaseAttribute->GetMaxMoveSpeed());
+	GetCharacterMovement()->MaxWalkSpeed = ClampedSpeed;
+	OnSpeedUpdated(ClampedSpeed, BaseAttribute->GetMaxMoveSpeed());
+}
+
+void ACharacterBase::HandleMaxMoveSpeedChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute || !GetCharacterMovement())
+	{
+		return;
+	}
+
+	// MaxMoveSpeed(상한치) 변경 시 현재 MoveSpeed가 상한치를 초과하지 않도록 클램프
+	float CurrentSpeed = BaseAttribute->GetMoveSpeed();
+	float ClampedSpeed = FMath::Clamp(CurrentSpeed, 0.0f, Data.NewValue);
+	GetCharacterMovement()->MaxWalkSpeed = ClampedSpeed;
+	OnSpeedUpdated(ClampedSpeed, Data.NewValue);
+}
+
+void ACharacterBase::HandleCurrentWeightChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute) return;
+	float MaxW = BaseAttribute->GetMaxWeight();
+	float Ratio = MaxW > 0.0f ? (Data.NewValue / MaxW) : 0.0f;
+	UpdateEncumbranceState(Data.NewValue, MaxW);
+	if (VisualComponent)
+	{
+		VisualComponent->HandleWeightUpdated(Data.NewValue, MaxW, Ratio);
+	}
+	OnWeightUpdated(Data.NewValue, MaxW, Ratio);
+}
+
+void ACharacterBase::HandleMaxWeightChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute) return;
+	float CurrW = BaseAttribute->GetCurrentWeight();
+	float Ratio = Data.NewValue > 0.0f ? (CurrW / Data.NewValue) : 0.0f;
+	UpdateEncumbranceState(CurrW, Data.NewValue);
+	if (VisualComponent)
+	{
+		VisualComponent->HandleWeightUpdated(CurrW, Data.NewValue, Ratio);
+	}
+	OnWeightUpdated(CurrW, Data.NewValue, Ratio);
+}
+
+void ACharacterBase::HandleBatteryChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute) return;
+	float MaxBat = BaseAttribute->GetMaxBattery();
+	OnBatteryUpdated(Data.NewValue, MaxBat, MaxBat > 0.0f ? (Data.NewValue / MaxBat) : 0.0f);
+}
+
+void ACharacterBase::HandleMaxBatteryChanged(const FOnAttributeChangeData& Data)
+{
+	if (!BaseAttribute) return;
+	float CurrBat = BaseAttribute->GetBattery();
+	OnBatteryUpdated(CurrBat, Data.NewValue, Data.NewValue > 0.0f ? (CurrBat / Data.NewValue) : 0.0f);
+}
+
+float ACharacterBase::GetCalculatedWalkSpeed() const
+{
+	if (!BaseAttribute)
+	{
+		return FMath::Max(0.0f, 500.0f + SpeedBuffFlat);
+	}
+
+	// 1. 상태별 기본 걷기 속도 (Base Speed) 결정
+	float BaseSpeed = 500.0f;
+
+	static const FGameplayTag PushingTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Pushing"), false);
+	static const FGameplayTag HeavyCarryTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Carrying.Heavy"), false);
+	static const FGameplayTag CarryCharTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Carrying.Character"), false);
+
+	bool bIsPushing = false;
+	if (const AMainCharacter* MainChar = Cast<AMainCharacter>(this))
+	{
+		bIsPushing = MainChar->bIsPushingMode;
+	}
+
+	if (bIsPushing ||
+		(PushingTag.IsValid() && HasMatchingGameplayTag(PushingTag)) ||
+		(HeavyCarryTag.IsValid() && HasMatchingGameplayTag(HeavyCarryTag)) ||
+		(CarryCharTag.IsValid() && HasMatchingGameplayTag(CarryCharTag)))
+	{
+		BaseSpeed = 350.0f; // 밀기, 무거운 택배 운반, 시체 운반 시 기본 속도 350
+	}
+
+	// 2. 소지 무게 비율(WeightRatio) 계산
+	float MaxWeight = BaseAttribute->GetMaxWeight();
+	if (MaxWeight <= 0.0f)
+	{
+		// 포션 가감(SpeedBuffFlat) 반영 (음수로 내려가지 않게 clamp)
+		return FMath::Max(0.0f, BaseSpeed + SpeedBuffFlat);
+	}
+
+	float WeightRatio = BaseAttribute->GetCurrentWeight() / MaxWeight;
+
+	// 3. 과적 단계별 배율 적용
+	float Result;
+	if (WeightRatio > 1.5f)
+	{
+		return 10.0f; // 과적 3단계: 극초저속 10.0f (점프/달리기 완전 차단) - 가감 무시
+	}
+	else if (WeightRatio > 1.3f)
+	{
+		Result = BaseSpeed * 0.50f; // 과적 2단계: 50% 감속 (일반 250, 밀기/무거운택배 175)
+	}
+	else if (WeightRatio > 1.0f)
+	{
+		Result = BaseSpeed * 0.85f; // 과적 1단계: 15% 감속 (일반 425, 밀기/무거운택배 297.5)
+	}
+	else
+	{
+		Result = BaseSpeed; // 정상
+	}
+
+	// 포션 가감(SpeedBuffFlat) 반영 (음수로 내려가지 않게 clamp)
+	return FMath::Max(0.0f, Result + SpeedBuffFlat);
+}
+
+void ACharacterBase::UpdateCharacterSpeed()
+{
+	if (!HasAuthority() || !BaseAttribute)
+	{
+		return;
+	}
+
+	float TargetSpeed = GetCalculatedWalkSpeed();
+
+	BaseAttribute->SetMoveSpeed(TargetSpeed);
+	if (GetCharacterMovement())
+	{
+		GetCharacterMovement()->MaxWalkSpeed = BaseAttribute->GetMoveSpeed();
+	}
+}
+
+void ACharacterBase::UpdateEncumbranceState(float InCurrentWeight, float InMaxWeight)
+{
+	if (InMaxWeight <= 0.0f) return;
+
+	float WeightRatio = InCurrentWeight / InMaxWeight;
+
+	static const FGameplayTag Encumbered_HeavyTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Encumbered.Heavy"), false);
+	static const FGameplayTag Encumbered_OverloadedTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Encumbered.Overloaded"), false);
+	static const FGameplayTag Encumbered_ImmobileTag = FGameplayTag::RequestGameplayTag(FName("State.Player.Encumbered.Immobile"), false);
+
+	AMainCharacter* MainChar = Cast<AMainCharacter>(this);
+	if (MainChar)
+	{
+		// 과적 2단계(> 1.3f) 이상이면 달리기 즉시 강제 해제
+		if (WeightRatio > 1.3f && MainChar->bIsSprinting)
+		{
+			MainChar->StopSprinting();
+		}
+	}
+
+	if (HasAuthority() && AbilitySystemComponent)
+	{
+		if (ActiveEncumbranceEffectHandle.IsValid())
+		{
+			AbilitySystemComponent->RemoveActiveGameplayEffect(ActiveEncumbranceEffectHandle);
+			ActiveEncumbranceEffectHandle.Invalidate();
+		}
+
+		TSubclassOf<UGameplayEffect> EffectToApply = nullptr;
+
+		if (WeightRatio > 1.5f)
+		{
+			EffectToApply = EncumberedTier3Effect;
+		}
+		else if (WeightRatio > 1.3f)
+		{
+			EffectToApply = EncumberedTier2Effect;
+		}
+		else if (WeightRatio > 1.0f)
+		{
+			EffectToApply = EncumberedTier1Effect;
+		}
+
+		if (EffectToApply)
+		{
+			FGameplayEffectContextHandle Context = AbilitySystemComponent->MakeEffectContext();
+			Context.AddSourceObject(this);
+			ActiveEncumbranceEffectHandle = AbilitySystemComponent->ApplyGameplayEffectToSelf(
+				EffectToApply.GetDefaultObject(), 1.0f, Context);
+		}
+		else
+		{
+			// GE가 할당되지 않았거나 과적이 해제(<= 1.0f)되었을 때 속도 직접 복구 및 적용
+			UpdateCharacterSpeed();
+		}
+	}
+
+	if (StatusComponent)
+	{
+		StatusComponent->RemoveStatusTag(Encumbered_HeavyTag);
+		StatusComponent->RemoveStatusTag(Encumbered_OverloadedTag);
+		StatusComponent->RemoveStatusTag(Encumbered_ImmobileTag);
+
+		if (WeightRatio > 1.5f)
+		{
+			StatusComponent->AddStatusTag(Encumbered_ImmobileTag);
+		}
+		else if (WeightRatio > 1.3f)
+		{
+			StatusComponent->AddStatusTag(Encumbered_OverloadedTag);
+		}
+		else if (WeightRatio > 1.0f)
+		{
+			StatusComponent->AddStatusTag(Encumbered_HeavyTag);
+		}
+	}
+}
+
+void ACharacterBase::GetOwnedGameplayTags(FGameplayTagContainer& TagContainer) const
+{
+	TagContainer.Reset();
+	if (AbilitySystemComponent)
+	{
+		AbilitySystemComponent->GetOwnedGameplayTags(TagContainer);
+	}
+}
+
+bool ACharacterBase::HasMatchingGameplayTag(FGameplayTag TagToCheck) const
+{
+	if (AbilitySystemComponent)
+	{
+		return AbilitySystemComponent->HasMatchingGameplayTag(TagToCheck);
+	}
+	return false;
+}
+
+bool ACharacterBase::HasAllMatchingGameplayTags(const FGameplayTagContainer& TagContainer) const
+{
+	if (AbilitySystemComponent)
+	{
+		return AbilitySystemComponent->HasAllMatchingGameplayTags(TagContainer);
+	}
+	return false;
+}
+
+bool ACharacterBase::HasAnyMatchingGameplayTags(const FGameplayTagContainer& TagContainer) const
+{
+	if (AbilitySystemComponent)
+	{
+		return AbilitySystemComponent->HasAnyMatchingGameplayTags(TagContainer);
+	}
+	return false;
+}
+
+float ACharacterBase::GetPushResistance_Implementation() const
+{
+	return 0.0f;
+}
+
+void ACharacterBase::Push_Implementation(AActor* Pusher, FVector PushDirection)
+{
+	LaunchCharacter(PushDirection * 500.0f + FVector(0, 0, 200.0f), true, true);
+	if (VisualComponent)
+	{
+		static const FGameplayTag HitTag = FGameplayTag::RequestGameplayTag(FName("State.Player.HitReaction"), false);
+		VisualComponent->SetTagTemporaryOverride(HitTag, 0.6f);
+	}
+}
+
+void ACharacterBase::ApplyTrapDamage_Implementation(float DamageAmount, AActor* Causer)
+{
+	if (!HasAuthority() || !BaseAttribute)
+	{
+		return;
+	}
+
+	float NewHealth = FMath::Max(0.0f, BaseAttribute->GetHealth() - DamageAmount);
+	BaseAttribute->SetHealth(NewHealth);
+
+	if (AMainCharacter* MainChar = Cast<AMainCharacter>(this))
+	{
+		MainChar->PlayHitReaction(0.4f);
+	}
+	else if (VisualComponent)
+	{
+		static const FGameplayTag HitTag = FGameplayTag::RequestGameplayTag(FName("State.Player.HitReaction"), false);
+		VisualComponent->SetTagTemporaryOverride(HitTag, 0.4f);
+	}
+
+	if (NewHealth <= 0.0f)
+	{
+		AMainCharacter* MainChar = Cast<AMainCharacter>(this);
+		if (MainChar)
+		{
+			MainChar->HandleHealthZero();
+		}
+	}
+}
+
+void ACharacterBase::ApplyTrapStatusEffect_Implementation(TSubclassOf<UGameplayEffect> EffectClass, AActor* Causer)
+{
+	if (!HasAuthority() || !AbilitySystemComponent || !EffectClass)
+	{
+		return;
+	}
+
+	FGameplayEffectContextHandle Context = AbilitySystemComponent->MakeEffectContext();
+	Context.AddSourceObject(Causer ? Causer : this);
+	AbilitySystemComponent->ApplyGameplayEffectToSelf(EffectClass.GetDefaultObject(), 1.0f, Context);
+}
+
+void ACharacterBase::ApplyTrapImpulse_Implementation(FVector ImpulseVector)
+{
+	LaunchCharacter(ImpulseVector, true, true);
+	if (VisualComponent)
+	{
+		static const FGameplayTag HitTag = FGameplayTag::RequestGameplayTag(FName("State.Player.HitReaction"), false);
+		VisualComponent->SetTagTemporaryOverride(HitTag, 0.6f);
+	}
+}
+
+void ACharacterBase::ForceDropCarriedItem_Implementation()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	AMainCharacter* MainChar = Cast<AMainCharacter>(this);
+	if (MainChar && MainChar->GetCarryingComponent() && MainChar->GetCarryingComponent()->IsCarrying())
+	{
+		MainChar->GetCarryingComponent()->GrabOrDrop();
+	}
+}
+
+void ACharacterBase::DrainBattery_Implementation(float DrainAmount)
+{
+	if (!HasAuthority() || !BaseAttribute)
+	{
+		return;
+	}
+
+	float NewBattery = FMath::Max(0.0f, BaseAttribute->GetBattery() - DrainAmount);
+	BaseAttribute->SetBattery(NewBattery);
+}
+
+void ACharacterBase::OnTrapHazardEncountered_Implementation(ETrapHazardType HazardType, AActor* TrapActor)
+{
+	if (HazardType == ETrapHazardType::ElectricShock)
+	{
+		static const FGameplayTag ElectricTag1 = FGameplayTag::RequestGameplayTag(FName("Event.Reaction.Eletric"), false);
+		static const FGameplayTag ElectricTag2 = FGameplayTag::RequestGameplayTag(FName("Event.Reaction.Electric"), false);
+		const FGameplayTag& TargetEventTag = ElectricTag1.IsValid() ? ElectricTag1 : ElectricTag2;
+
+		if (TargetEventTag.IsValid())
+		{
+			FGameplayEventData EventData;
+			EventData.EventTag = TargetEventTag;
+			EventData.Instigator = TrapActor;
+			EventData.Target = this;
+			UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(this, TargetEventTag, EventData);
+		}
+	}
+}
